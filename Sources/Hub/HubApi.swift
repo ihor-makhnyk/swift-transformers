@@ -127,13 +127,31 @@ public extension HubApi {
         downloadBase.appending(component: repo.type.rawValue).appending(component: repo.id)
     }
     
-    struct HubFileDownloader {
+    final class HubFileDownloader {
         let repo: Repo
         let repoDestination: URL
         let relativeFilename: String
         let hfToken: String?
         let endpoint: String?
         let backgroundSession: Bool
+        var downloader: Downloader?
+        
+        init(repo: Repo,
+             repoDestination: URL,
+             relativeFilename: String,
+             hfToken: String?,
+             endpoint: String?,
+             backgroundSession: Bool,
+             downloader: Downloader? = nil
+        ) {
+            self.repo = repo
+            self.repoDestination = repoDestination
+            self.relativeFilename = relativeFilename
+            self.hfToken = hfToken
+            self.endpoint = endpoint
+            self.backgroundSession = backgroundSession
+            self.downloader = makeDownloader(downloader)
+        }
 
         var source: URL {
             // https://huggingface.co/coreml-projects/Llama-2-7b-chat-coreml/resolve/main/tokenizer.json?download=true
@@ -165,10 +183,8 @@ public extension HubApi {
         // (See for example PipelineLoader in swift-coreml-diffusers)
         @discardableResult
         func download(progressHandler: @escaping (Double) -> Void) async throws -> URL {
-            guard !downloaded else { return destination }
+            guard !downloaded, let downloader else { return destination }
 
-            try prepareDestination()
-            let downloader = Downloader(from: source, to: destination, using: hfToken, inBackground: backgroundSession)
             let downloadSubscriber = downloader.downloadState.sink { state in
                 if case .downloading(let progress) = state {
                     progressHandler(progress)
@@ -179,15 +195,26 @@ public extension HubApi {
             }
             return destination
         }
+        
+        public func cancel() {
+            downloader?.cancel()
+        }
+        
+        private func makeDownloader(_ downloader: Downloader?) -> Downloader {
+            if let downloader { return downloader }
+            try? prepareDestination()
+            return Downloader(from: source, to: destination, using: hfToken, inBackground: backgroundSession)
+        }
     }
 
     @discardableResult
-    func snapshot(from repo: Repo, matching globs: [String] = [], progressHandler: @escaping (Progress) -> Void = { _ in }) async throws -> URL {
+    func snapshot(from repo: Repo, matching globs: [String] = [], progressHandler: @escaping (Progress) -> Void = { _ in }, downloadersCallback: @escaping ([HubFileDownloader]) -> Void = { _ in }) async throws -> URL {
         let filenames = try await getFilenames(from: repo, matching: globs)
         let progress = Progress(totalUnitCount: Int64(filenames.count))
         let repoDestination = localRepoLocation(repo)
+        var downloaders: [HubFileDownloader] = []
+        let fileProgress = Progress(totalUnitCount: 100, parent: progress, pendingUnitCount: 1)
         for filename in filenames {
-            let fileProgress = Progress(totalUnitCount: 100, parent: progress, pendingUnitCount: 1)
             let downloader = HubFileDownloader(
                 repo: repo,
                 repoDestination: repoDestination,
@@ -196,6 +223,10 @@ public extension HubApi {
                 endpoint: endpoint,
                 backgroundSession: useBackgroundSession
             )
+            downloaders.append(downloader)
+        }
+        downloadersCallback(downloaders)
+        for downloader in downloaders {
             try await downloader.download { fractionDownloaded in
                 fileProgress.completedUnitCount = Int64(100 * fractionDownloaded)
                 progressHandler(progress)
@@ -207,18 +238,22 @@ public extension HubApi {
     }
     
     @discardableResult
-    func snapshot(from repoId: String, matching globs: [String] = [], progressHandler: @escaping (Progress) -> Void = { _ in }) async throws -> URL {
+    func snapshot(from repoId: String, matching globs: [String] = [], progressHandler: @escaping (Progress) -> Void = { _ in }, downloadersCallback: @escaping ([HubFileDownloader]) -> Void = { _ in }) async throws -> URL {
         return try await snapshot(from: Repo(id: repoId), matching: globs, progressHandler: progressHandler)
     }
     
     @discardableResult
-    func snapshot(from repo: Repo, matching glob: String, progressHandler: @escaping (Progress) -> Void = { _ in }) async throws -> URL {
+    func snapshot(from repo: Repo, matching glob: String, progressHandler: @escaping (Progress) -> Void = { _ in }, downloadersCallback: @escaping ([HubFileDownloader]) -> Void = { _ in }) async throws -> URL {
         return try await snapshot(from: repo, matching: [glob], progressHandler: progressHandler)
     }
     
     @discardableResult
-    func snapshot(from repoId: String, matching glob: String, progressHandler: @escaping (Progress) -> Void = { _ in }) async throws -> URL {
+    func snapshot(from repoId: String, matching glob: String, progressHandler: @escaping (Progress) -> Void = { _ in }, downloadersCallback: @escaping ([HubFileDownloader]) -> Void = { _ in }) async throws -> URL {
         return try await snapshot(from: Repo(id: repoId), matching: [glob], progressHandler: progressHandler)
+    }
+    
+    func cancelDownloads(_ downloaders: [HubFileDownloader]) {
+        downloaders.forEach { $0.cancel() }
     }
 }
 
@@ -240,19 +275,19 @@ public extension Hub {
         return try await HubApi.shared.getFilenames(from: Repo(id: repoId), matching: glob)
     }
     
-    static func snapshot(from repo: Repo, matching globs: [String] = [], progressHandler: @escaping (Progress) -> Void = { _ in }) async throws -> URL {
+    static func snapshot(from repo: Repo, matching globs: [String] = [], progressHandler: @escaping (Progress) -> Void = { _ in }, downloadersCallback: @escaping ([HubApi.HubFileDownloader]) -> Void = { _ in }) async throws -> URL {
         return try await HubApi.shared.snapshot(from: repo, matching: globs, progressHandler: progressHandler)
     }
     
-    static func snapshot(from repoId: String, matching globs: [String] = [], progressHandler: @escaping (Progress) -> Void = { _ in }) async throws -> URL {
+    static func snapshot(from repoId: String, matching globs: [String] = [], progressHandler: @escaping (Progress) -> Void = { _ in }, downloadersCallback: @escaping ([HubApi.HubFileDownloader]) -> Void = { _ in }) async throws -> URL {
         return try await HubApi.shared.snapshot(from: Repo(id: repoId), matching: globs, progressHandler: progressHandler)
     }
     
-    static func snapshot(from repo: Repo, matching glob: String, progressHandler: @escaping (Progress) -> Void = { _ in }) async throws -> URL {
+    static func snapshot(from repo: Repo, matching glob: String, progressHandler: @escaping (Progress) -> Void = { _ in }, downloadersCallback: @escaping ([HubApi.HubFileDownloader]) -> Void = { _ in }) async throws -> URL {
         return try await HubApi.shared.snapshot(from: repo, matching: glob, progressHandler: progressHandler)
     }
     
-    static func snapshot(from repoId: String, matching glob: String, progressHandler: @escaping (Progress) -> Void = { _ in }) async throws -> URL {
+    static func snapshot(from repoId: String, matching glob: String, progressHandler: @escaping (Progress) -> Void = { _ in }, downloadersCallback: @escaping ([HubApi.HubFileDownloader]) -> Void = { _ in }) async throws -> URL {
         return try await HubApi.shared.snapshot(from: Repo(id: repoId), matching: glob, progressHandler: progressHandler)
     }
     
